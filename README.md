@@ -42,6 +42,27 @@ language.
 
 ## Quick start
 
+### On a Mac: one command
+
+`scripts/mac-setup.sh` does the whole thing. It checks for Node 20+, Homebrew,
+Claude Code and your Claude login, offers to install anything missing, creates
+`.env.local`, installs the dependencies, makes sure ports 8787 and 5173 are
+free, then starts both halves and opens the app in Chrome.
+
+```bash
+git clone https://github.com/Mamoun506-coder/jarvis.git
+cd jarvis
+bash scripts/mac-setup.sh
+```
+
+It asks before installing anything and is safe to run again. Add `--writes` to
+allow effectful tools, or `--no-start` to set up without launching. Because the
+bridge reads its settings from the shell rather than from `.env.local`, this
+script also passes any `JARVIS_*` and `ELEVENLABS_API_KEY` lines you put in
+`.env.local` through to it.
+
+### Everywhere else
+
 First, install, then start it:
 
 ```bash
