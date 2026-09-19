@@ -1039,6 +1039,16 @@ const RESULT_FAILURES = {
   default: 'The turn ended without an answer.',
 }
 
+/**
+ * Said instead when the account itself is the reason. A limit that has been
+ * reached is not a fault in the machine, and telling someone their turn
+ * "failed part way through" sends them debugging an install that is fine.
+ */
+const RATE_LIMIT_MESSAGE =
+  'Your Claude usage limit has been reached, so I cannot answer right now.' +
+  ' The bridge and the interface are both working — check the terminal for' +
+  ' when the limit resets.'
+
 wss.on('connection', (socket) => {
   console.log('[jarvis] client connected')
 
@@ -1085,6 +1095,14 @@ wss.on('connection', (socket) => {
    */
   let answering = null
   const sendTurn = (msg) => send({ ...msg, ask: answering })
+
+  /**
+   * The most recent subscription limit the agent reported, kept because the
+   * event that carries it and the result that fails because of it are two
+   * different messages — by the time a turn dies, the reason has already gone
+   * past.
+   */
+  let lastRateLimit = null
 
   /**
    * Asking the browser for something and waiting for the answer.
@@ -1252,6 +1270,19 @@ wss.on('connection', (socket) => {
       // would sit silent until the entire answer was written. Partial events
       // are what let speech start on the first finished sentence.
       includePartialMessages: true,
+      // The agent is a child process — the real `claude` CLI — and everything
+      // it fails at, it says on its own stderr. Without this callback the SDK
+      // swallows that stream entirely, so a subprocess that cannot start, or
+      // dies mid-turn, reaches the terminal as nothing more than the word
+      // `error_during_execution`. Anything the child considers worth saying is
+      // worth showing; debug chatter is left to JARVIS_DEBUG.
+      stderr: (data) => {
+        const text = String(data).trimEnd()
+        if (!text) return
+        if (process.env.JARVIS_DEBUG === '1' || !/^\s*\[DEBUG\]/.test(text)) {
+          console.error(`[claude] ${text}`)
+        }
+      },
       // Signature is (toolName, input, options) and it must return a
       // PermissionResult object. Returning a bare boolean silently denies
       // everything, with the tool name arriving undefined.
@@ -1349,13 +1380,57 @@ wss.on('connection', (socket) => {
                 costUsd: msg.total_cost_usd ?? null,
               })
             } else {
+              // `error_during_execution` on its own says only that the turn
+              // died, not what killed it. Every field that narrows it down is
+              // already on this message and was being thrown away: the CLI's
+              // own `errors` strings, the API status when the failure came
+              // from the request, `stop_reason` and `terminal_reason` for how
+              // the turn ended, and the permission denials that say the gate
+              // below refused something the model needed. Print the lot — one
+              // failure is rare enough to deserve the lines, and a turn that
+              // fails every time is unfixable without them.
+              console.error(`[jarvis] turn failed: ${msg.subtype}`)
+              for (const [label, value] of [
+                ['errors', msg.errors],
+                ['api_error_status', msg.api_error_status],
+                ['stop_reason', msg.stop_reason],
+                ['terminal_reason', msg.terminal_reason],
+                ['permission_denials', msg.permission_denials],
+                ['num_turns', msg.num_turns],
+              ]) {
+                if (value === undefined || value === null) continue
+                if (Array.isArray(value) && value.length === 0) continue
+                console.error(
+                  `[jarvis]   ${label}: ${
+                    typeof value === 'object' ? JSON.stringify(value) : value
+                  }`,
+                )
+              }
+              if (lastRateLimit && lastRateLimit.status !== 'allowed') {
+                console.error(
+                  `[jarvis]   rate limit: ${lastRateLimit.status}` +
+                    (lastRateLimit.rateLimitType
+                      ? ` (${lastRateLimit.rateLimitType})`
+                      : '') +
+                    (lastRateLimit.errorCode
+                      ? ` — ${lastRateLimit.errorCode}`
+                      : ''),
+                )
+              }
               console.error(
-                `[jarvis] turn failed: ${msg.subtype}`,
-                msg.errors ?? '',
+                '[jarvis]   (run the bridge with JARVIS_DEBUG=1 for the full' +
+                  ' message stream; lines starting [claude] are the agent' +
+                  " process's own stderr)",
               )
               sendTurn({
                 type: 'error',
-                message: RESULT_FAILURES[msg.subtype] ?? RESULT_FAILURES.default,
+                // A rejected limit is not a mystery failure and should not be
+                // reported as one — it is the single most likely reason every
+                // turn in a row dies on a setup that was working.
+                message:
+                  lastRateLimit?.status === 'rejected'
+                    ? RATE_LIMIT_MESSAGE
+                    : RESULT_FAILURES[msg.subtype] ?? RESULT_FAILURES.default,
               })
             }
             // Whatever was waiting on this turn to finish can go now. This is
@@ -1368,6 +1443,28 @@ wss.on('connection', (socket) => {
             heldTools.clear()
             break
 
+          // Subscription limits arrive on their own message and were being
+          // dropped on the floor. A rejected limit fails every turn that
+          // follows it, and looks exactly like a broken install from the
+          // outside — so record it, and say so the first time it changes.
+          case 'rate_limit_event': {
+            const info = msg.rate_limit_info
+            if (!info) break
+            const changed = info.status !== lastRateLimit?.status
+            lastRateLimit = info
+            if (changed && info.status !== 'allowed') {
+              console.warn(
+                `[jarvis] rate limit ${info.status}` +
+                  (info.rateLimitType ? ` (${info.rateLimitType})` : '') +
+                  (info.errorCode ? ` — ${info.errorCode}` : '') +
+                  (info.resetsAt
+                    ? ` — resets ${new Date(info.resetsAt * 1000).toLocaleString()}`
+                    : ''),
+              )
+            }
+            break
+          }
+
           case 'system':
             if (msg.subtype === 'init') {
               // Servers report 'pending' until first use — they connect
@@ -1377,6 +1474,26 @@ wss.on('connection', (socket) => {
                 .map((s) => s.name)
               send({ type: 'ready', servers: usable })
               console.log(`[jarvis] ${usable.length} MCP servers available`)
+              // The agent is a separate program with its own release cycle,
+              // and this bridge pins only the SDK. When a turn fails the first
+              // question is which version actually ran and what it signed in
+              // as, so state both once per session rather than asking someone
+              // to go and find out.
+              const failed = (msg.mcp_servers ?? []).filter(
+                (s) => s.status === 'needs-auth' || s.status === 'failed',
+              )
+              if (failed.length) {
+                console.warn(
+                  `[jarvis] unusable MCP servers: ${failed
+                    .map((s) => `${s.name} (${s.status})`)
+                    .join(', ')}`,
+                )
+              }
+              console.log(
+                `[jarvis] agent claude-code ${msg.claude_code_version ?? '?'}` +
+                  ` · model ${msg.model ?? '?'}` +
+                  ` · auth ${msg.apiKeySource ?? '?'}`,
+              )
             }
             break
         }
