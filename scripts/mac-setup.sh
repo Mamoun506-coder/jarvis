@@ -452,49 +452,101 @@ else
 fi
 
 APP_PID=''
+
+# Stopping has to take everything with it. `npm start` is only a wrapper around
+# `node scripts/start.mjs`, and npm does not reliably pass a signal on to the
+# process it spawned — so signalling npm could leave the bridge and Vite alive,
+# still holding ports 8787 and 5173, and the next run would refuse to start
+# against its own leftovers. Two changes prevent that: run the launcher
+# directly, so the thing we signal is the thing that knows how to shut both
+# halves down, and start it in its own process group so we can take down the
+# whole group if the launcher itself is wedged.
 cleanup() {
   trap - INT TERM EXIT
-  if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
-    kill -TERM "$APP_PID" 2>/dev/null || true
-    wait "$APP_PID" 2>/dev/null || true
-  fi
+  [ -n "$APP_PID" ] || return 0
+  kill -0 "$APP_PID" 2>/dev/null || return 0
+  kill -TERM -"$APP_PID" 2>/dev/null || kill -TERM "$APP_PID" 2>/dev/null || true
+  wait "$APP_PID" 2>/dev/null || true
 }
 trap cleanup INT TERM EXIT
 
+# stdin comes from /dev/null so the app can never be stopped by SIGTTIN for
+# reading a terminal it no longer owns.
+set -m
 if [ "$WRITES" = "1" ]; then
-  npm start -- --writes &
+  node scripts/start.mjs --writes < /dev/null &
 else
-  npm start &
+  node scripts/start.mjs < /dev/null &
 fi
 APP_PID=$!
+set +m
 
-# Wait for each half to actually answer before declaring victory — "it printed
-# a URL" and "it is ready" are not the same thing.
-wait_for_url() {
-  local url="$1" tries="${2:-90}" i=0
-  while [ "$i" -lt "$tries" ]; do
-    kill -0 "$APP_PID" 2>/dev/null || return 1
-    curl -fsS --max-time 2 -o /dev/null "$url" 2>/dev/null && return 0
-    sleep 1
-    i=$((i + 1))
+# Waiting for both halves to come up.
+#
+# The two halves do not bind their sockets the same way, and that difference
+# used to shut a perfectly healthy JARVIS down on a Mac.
+#
+# The bridge calls `server.listen(PORT)` with no address, so it binds every
+# interface and answers on 127.0.0.1. Vite is given a hostname instead —
+# `httpServer.listen(port, 'localhost')` — and Node binds whichever single
+# address the OS returns first for that name. On macOS that is ::1, so Vite
+# ends up listening on [::1]:5173 and nothing at all on 127.0.0.1:5173.
+# Chrome asks for "localhost", gets ::1, and works fine — which is why the app
+# visibly ran while a probe aimed at 127.0.0.1 got connection-refused for
+# ninety seconds and then declared the interface dead.
+#
+# So ask on every address a local server might have picked, and if HTTP still
+# says nothing, ask the OS whether anything is listening on that port at all.
+http_answers() {
+  local port="$1" path="${2:-}" host
+  for host in localhost 127.0.0.1 '[::1]'; do
+    curl -fsS --max-time 2 -o /dev/null "http://${host}:${port}/${path}" 2>/dev/null && return 0
   done
   return 1
 }
 
+port_is_listening() {
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1
+}
+
+# 0 = up, 1 = the app itself died, 2 = still running but we could not confirm.
+# Only 1 is a failure. Never report 2 as death: the app is alive, and killing
+# it because a probe was inconclusive is exactly the bug this replaced.
+wait_for_half() {
+  local port="$1" path="${2:-}" tries="${3:-90}" i=0
+  while [ "$i" -lt "$tries" ]; do
+    kill -0 "$APP_PID" 2>/dev/null || return 1
+    http_answers "$port" "$path" && return 0
+    port_is_listening "$port" && return 0
+    sleep 1
+    i=$((i + 1))
+  done
+  return 2
+}
+
 printf '\n      %sWaiting for both halves to come up…%s\n' "$DIM" "$RESET"
 
-if ! wait_for_url 'http://127.0.0.1:8787/health'; then
-  die "The brain (the bridge) did not start." \
+wait_for_half 8787 health && BRAIN=0 || BRAIN=$?
+if [ "$BRAIN" = "1" ]; then
+  die "The brain (the bridge) stopped before it finished starting." \
     "Look at the red text above for the reason." \
     "The usual cause is not being signed in — type  claude  and sign in, then try again."
+elif [ "$BRAIN" = "2" ]; then
+  warn 'Could not confirm the brain is answering, but it is still running — carrying on.'
+else
+  ok 'The brain is awake (bridge on port 8787).'
 fi
-ok 'The brain is awake (bridge on port 8787).'
 
-if ! wait_for_url 'http://127.0.0.1:5173/'; then
-  die "The interface did not start." \
+wait_for_half 5173 '' && FACE=0 || FACE=$?
+if [ "$FACE" = "1" ]; then
+  die "The interface stopped before it finished starting." \
     "Look at the red text above for the reason, then run this script again."
+elif [ "$FACE" = "2" ]; then
+  warn 'Could not confirm the interface is answering, but it is still running.'
+  note 'Open http://localhost:5173 in Chrome — it is very likely there.'
+else
+  ok 'The interface is up (http://localhost:5173).'
 fi
-ok 'The interface is up (http://localhost:5173).'
 
 if [ -n "$BROWSER" ]; then
   open -a "$BROWSER" 'http://localhost:5173' 2>/dev/null \
