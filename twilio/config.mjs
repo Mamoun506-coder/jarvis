@@ -42,6 +42,15 @@ export function readiness() {
   if (!c.publicBaseUrl) problems.push('TWILIO_PUBLIC_BASE_URL is not set')
   else if (!/^https:\/\//.test(c.publicBaseUrl))
     problems.push('TWILIO_PUBLIC_BASE_URL must be https — Twilio signs the URL it called')
+
+  // Only required when relay mode is actually switched on. Greeting mode is
+  // the default and must keep starting with none of this set.
+  if ((process.env.TWILIO_VOICE_MODE ?? 'greeting') === 'relay') {
+    const relay = process.env.TWILIO_RELAY_WEBSOCKET_URL?.trim()
+    if (!relay) problems.push('TWILIO_VOICE_MODE=relay needs TWILIO_RELAY_WEBSOCKET_URL')
+    else if (!/^wss:\/\//.test(relay))
+      problems.push('TWILIO_RELAY_WEBSOCKET_URL must be a wss:// address')
+  }
   return { ready: problems.length === 0, problems }
 }
 

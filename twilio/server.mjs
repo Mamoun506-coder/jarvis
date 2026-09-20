@@ -37,6 +37,7 @@ import {
 } from './guard.mjs'
 import { CONTENT_TYPE, dialTwiml, sayTwiml, voiceResponse } from './twiml.mjs'
 import { placeCall, redirectCall, sendSms } from './client.mjs'
+import { attachRelay, relayGreeting, relayStatus, relayUrl } from './relay.mjs'
 
 /** A webhook body is a handful of short fields; anything larger is not Twilio. */
 const MAX_BODY = 64 * 1024
@@ -192,12 +193,14 @@ async function route(req, res) {
         public_base_url: publicBaseUrl ?? null,
       },
       voice_mode: process.env.TWILIO_VOICE_MODE ?? 'greeting',
+      relay: relayStatus(),
       active_calls: activeCalls.size,
       webhooks: {
         voice: '/twilio/voice/incoming',
         voice_choice: '/twilio/voice/choice',
         voice_status: '/twilio/voice/status',
         messaging: '/twilio/sms/incoming',
+        relay_websocket: '/twilio/voice/relay',
       },
       problems: state.problems,
     })
@@ -244,7 +247,15 @@ async function route(req, res) {
         reap()
       }
       logEvent('call.received', { from: params.From, to: params.To, sid: callSid })
-      return xml(res, voiceResponse(process.env.TWILIO_VOICE_MODE ?? 'greeting', {}))
+      // The mode decides what the caller gets. Relay hands the call to the
+      // WebSocket below; greeting — the default — is the untouched flow.
+      return xml(
+        res,
+        voiceResponse(process.env.TWILIO_VOICE_MODE ?? 'greeting', {
+          relayWebSocketUrl: relayUrl(),
+          welcome: relayGreeting(),
+        }),
+      )
     }
 
     if (path === '/twilio/voice/choice') {
@@ -389,8 +400,8 @@ export function reminderText({ name, when, service, location, contact }) {
   return `${who}a reminder about your appointment${what}${where} on ${when}.${how}`.trim()
 }
 
-export function createGateway() {
-  return createServer((req, res) => {
+export function createGateway({ relay = true } = {}) {
+  const server = createServer((req, res) => {
     route(req, res).catch((err) => {
       const status = err.status ?? 500
       logEvent('request.failed', { reason: redact(err.message) })
@@ -398,6 +409,11 @@ export function createGateway() {
       else res.end()
     })
   })
+  // The relay listens on this same server's upgrade event. It refuses every
+  // connection unless TWILIO_VOICE_MODE=relay, so attaching it changes
+  // nothing for a gateway running the default greeting flow.
+  if (relay) server.relay = attachRelay(server)
+  return server
 }
 
 /** Started directly (npm run twilio:start) rather than imported by a test. */
@@ -419,6 +435,13 @@ if (runningDirectly) {
       console.log(`[twilio] voice webhook:     ${publicBaseUrl}/twilio/voice/incoming`)
       console.log(`[twilio] messaging webhook: ${publicBaseUrl}/twilio/sms/incoming`)
       console.log(`[twilio] status callback:   ${publicBaseUrl}/twilio/voice/status`)
+      const relayInfo = relayStatus()
+      if (relayInfo.enabled) {
+        console.log(`[twilio] relay websocket:    ${relayInfo.websocket_url}`)
+        console.log(`[twilio] LIVE VOICE RELAY IS ON — callers reach the ${relayInfo.agent}`)
+      } else {
+        console.log('[twilio] voice mode: greeting (set TWILIO_VOICE_MODE=relay for live voice)')
+      }
     } else {
       console.warn('[twilio] not fully configured yet:')
       for (const problem of state.problems) console.warn(`[twilio]   · ${problem}`)

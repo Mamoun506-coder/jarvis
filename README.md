@@ -353,13 +353,47 @@ control stay exactly as they were.
   `~/.jarvis/twilio-log.jsonl` (0600); the terminal gets masked numbers and no
   message bodies.
 
-### Live AI voice, later
+### Live voice (ConversationRelay)
 
-Incoming calls currently get a greeting and a "press 1 for a person" transfer.
-`twilio/twiml.mjs` has a `relay` mode for Twilio ConversationRelay already
-shaped; switching to it means supplying a WebSocket URL and a conversation
-loop. It is deliberately not wired up — it would put a live microphone into an
-agent, and that needs its own gate.
+Incoming calls get the greeting and a "press 1 for a person" transfer by
+default. Setting `TWILIO_VOICE_MODE=relay` instead hands the call to a
+WebSocket on the same gateway, where Twilio streams transcripts in and we send
+speech back — the audio itself never reaches this machine.
+
+```bash
+export TWILIO_VOICE_MODE=relay
+export TWILIO_RELAY_WEBSOCKET_URL=wss://your-tunnel.example.com/twilio/voice/relay
+npm run twilio:start
+```
+
+The URL is the **wss://** form of the same tunnel, path `/twilio/voice/relay`.
+It must match exactly: Twilio signs the handshake over that URL, and the
+gateway verifies against the configured value, never the inbound `Host`.
+
+**The agent does not think yet.** Version one is a deterministic test
+receptionist — it repeats what it heard and names itself. Replacing it is one
+function, `testReceptionist()` in `twilio/relay.mjs`; everything around it
+(handshake signature, rate limits, logging, message handling) is already tested
+and stays as it is. It is deliberately separate because wiring a stranger's
+voice into the JARVIS reasoning loop — which holds mail, calendar and a phone
+line — deserves its own change and its own gate.
+
+Messages handled: `setup`, `prompt`, `dtmf`, `interrupt`, `error`. Partial
+prompts (`last: false`) are ignored so JARVIS does not talk over the caller.
+Replies are ConversationRelay `text` messages with `last: true`,
+`interruptible: true`, `preemptible: false`.
+
+Relay-specific protections, on top of everything the HTTP gateway already does:
+
+- **Fails closed.** No auth token, no configured wss URL, or no signature on
+  the handshake all mean the socket is refused before it opens.
+- **Off unless asked.** Any value of `TWILIO_VOICE_MODE` other than `relay`
+  refuses every connection, and the default is `greeting`.
+- **Connection rate limits** per source address, applied before the signature
+  is verified.
+- **Caller numbers are masked even in the file log** — unlike the SMS record.
+  That file also holds what was said on the call, and a full number beside a
+  transcript is a different kind of record to keep on a laptop.
 
 ---
 

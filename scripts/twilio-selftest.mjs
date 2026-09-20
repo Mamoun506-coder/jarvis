@@ -267,6 +267,196 @@ for (const file of ['../twilio/config.mjs', '../twilio/client.mjs', '../twilio/s
     !/AC[0-9a-f]{32}/.test(src) && !/\b\+1\d{10}\b/.test(src))
 }
 
+
+// --- 14. ConversationRelay: the live voice socket ---------------------------
+
+const { WebSocket } = await import('ws')
+
+const {
+  createSession, relayHandshakeAllowed, relayEnabled, textMessage, testReceptionist,
+} = await import('../twilio/relay.mjs')
+
+// Off by default: nothing set means greeting mode, which must be untouched.
+delete process.env.TWILIO_VOICE_MODE
+check('relay is off when TWILIO_VOICE_MODE is unset', relayEnabled() === false)
+check('greeting mode is still the default response',
+  /<Gather/.test(voiceResponse(process.env.TWILIO_VOICE_MODE ?? 'greeting', {})))
+
+const defaultCall = await webhook('/twilio/voice/incoming',
+  { From: '+15558675350', To: '+15558675309', CallSid: 'CA200' })
+check('an incoming call still gets the greeting by default',
+  /<Gather/.test(defaultCall.text) && !/ConversationRelay/.test(defaultCall.text))
+
+process.env.TWILIO_VOICE_MODE = 'greeting'
+check('relay stays off when the mode is explicitly greeting', relayEnabled() === false)
+
+// Now switch it on.
+const RELAY_URL = 'wss://jarvis.example.test/twilio/voice/relay'
+process.env.TWILIO_VOICE_MODE = 'relay'
+process.env.TWILIO_RELAY_WEBSOCKET_URL = RELAY_URL
+check('relay activates only when explicitly set', relayEnabled() === true)
+
+const relayCall = await webhook('/twilio/voice/incoming',
+  { From: '+15558675351', To: '+15558675309', CallSid: 'CA201' })
+check('relay mode returns Connect/ConversationRelay', /<Connect><ConversationRelay/.test(relayCall.text))
+check('the TwiML carries the configured wss URL', relayCall.text.includes(RELAY_URL))
+check('the TwiML carries the welcome greeting',
+  /welcomeGreeting="Thank you for calling Quick Assist Locksmith\. How can I help you today\?"/.test(relayCall.text),
+  relayCall.text)
+
+// --- 15. handshake signature ------------------------------------------------
+
+const handshake = (sig, url = '/twilio/voice/relay') => ({
+  url,
+  headers: sig === null ? {} : { 'x-twilio-signature': sig },
+})
+
+const goodSig = expectedSignature(AUTH_TOKEN, RELAY_URL, {})
+check('a correctly signed handshake is allowed',
+  relayHandshakeAllowed(handshake(goodSig)).ok === true,
+  JSON.stringify(relayHandshakeAllowed(handshake(goodSig))))
+check('an unsigned handshake is refused',
+  relayHandshakeAllowed(handshake(null)).code === 403)
+check('a wrong signature is refused',
+  relayHandshakeAllowed(handshake('not-a-signature')).code === 403)
+check('a signature over a different URL is refused',
+  relayHandshakeAllowed(handshake(expectedSignature(AUTH_TOKEN, 'wss://evil.test/twilio/voice/relay', {}))).code === 403)
+check('a signature made with the wrong token is refused',
+  relayHandshakeAllowed(handshake(expectedSignature('wrong-token', RELAY_URL, {}))).code === 403)
+
+const savedRelayUrl = process.env.TWILIO_RELAY_WEBSOCKET_URL
+delete process.env.TWILIO_RELAY_WEBSOCKET_URL
+check('with no configured URL the handshake fails closed',
+  relayHandshakeAllowed(handshake(goodSig)).code === 503)
+process.env.TWILIO_RELAY_WEBSOCKET_URL = savedRelayUrl
+
+// --- 16. a real socket, end to end ------------------------------------------
+
+const relayGateway = createGateway()
+await new Promise((r) => relayGateway.listen(0, '127.0.0.1', r))
+const relayPort = relayGateway.address().port
+
+const connect = (sig) =>
+  new Promise((resolve) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${relayPort}/twilio/voice/relay`, {
+      headers: sig === null ? {} : { 'x-twilio-signature': sig },
+    })
+    const received = []
+    const done = (outcome) => resolve({ outcome, received, ws })
+    ws.on('open', () => done('open'))
+    ws.on('message', (d) => received.push(JSON.parse(d.toString())))
+    ws.on('unexpected-response', (_req, res) => done(`rejected-${res.statusCode}`))
+    ws.on('error', () => done('error'))
+  })
+
+const refused = await connect(null)
+check('an unsigned websocket connection is rejected with 403', refused.outcome === 'rejected-403')
+
+const refusedBad = await connect('bogus-signature')
+check('a bad-signature websocket connection is rejected', refusedBad.outcome === 'rejected-403')
+
+const live = await connect(goodSig)
+check('a correctly signed websocket connection is accepted', live.outcome === 'open', live.outcome)
+
+if (live.outcome === 'open') {
+  const ws = live.ws
+  const waitFor = (n) =>
+    new Promise((resolve) => {
+      const started = Date.now()
+      const poll = setInterval(() => {
+        if (live.received.length >= n || Date.now() - started > 3000) {
+          clearInterval(poll)
+          resolve()
+        }
+      }, 20)
+    })
+
+  ws.send(JSON.stringify({
+    type: 'setup', sessionId: 'VX123', callSid: 'CA300',
+    from: '+15558675360', to: '+15558675309', direction: 'inbound',
+  }))
+  await new Promise((r) => setTimeout(r, 120))
+  check('setup produces no spoken reply', live.received.length === 0)
+
+  ws.send(JSON.stringify({ type: 'prompt', voicePrompt: 'I am locked out of my flat', lang: 'en-US', last: true }))
+  await waitFor(1)
+  const spoken = live.received[0]
+  check('a prompt is answered', Boolean(spoken), JSON.stringify(live.received))
+  check('the reply repeats what was heard',
+    spoken?.token === 'I heard you say: I am locked out of my flat. This is the JARVIS test receptionist.',
+    spoken?.token)
+  check('the reply is a ConversationRelay text message', spoken?.type === 'text')
+  check('the reply is marked last', spoken?.last === true)
+  check('the reply is interruptible', spoken?.interruptible === true)
+  check('the reply is not preemptible', spoken?.preemptible === false)
+  check('the reply carries exactly the documented keys',
+    JSON.stringify(Object.keys(spoken ?? {}).sort()) ===
+      JSON.stringify(['interruptible', 'last', 'preemptible', 'token', 'type']),
+    JSON.stringify(Object.keys(spoken ?? {})))
+
+  ws.send(JSON.stringify({ type: 'prompt', voicePrompt: 'partial words', lang: 'en-US', last: false }))
+  await new Promise((r) => setTimeout(r, 150))
+  check('a partial prompt is not answered over the caller', live.received.length === 1)
+
+  ws.send(JSON.stringify({ type: 'dtmf', digit: '1' }))
+  await waitFor(2)
+  check('a keypress is acknowledged', /I heard you press 1/.test(live.received[1]?.token ?? ''))
+
+  ws.send(JSON.stringify({ type: 'interrupt', utteranceUntilInterrupt: 'sorry but', durationUntilInterruptMs: 400 }))
+  await new Promise((r) => setTimeout(r, 120))
+  check('an interrupt stops us talking rather than replying', live.received.length === 2)
+
+  ws.send(JSON.stringify({ type: 'error', description: 'something went wrong upstream' }))
+  await new Promise((r) => setTimeout(r, 120))
+  check('an error message is absorbed without a reply', live.received.length === 2)
+
+  ws.send('this is not json at all')
+  await new Promise((r) => setTimeout(r, 120))
+  check('malformed json does not drop the call', ws.readyState === ws.OPEN)
+
+  ws.close()
+  await new Promise((r) => setTimeout(r, 150))
+}
+
+// --- 17. the session handler in isolation -----------------------------------
+
+const spokenInIsolation = []
+const session = createSession((m) => spokenInIsolation.push(m))
+session.handle({ type: 'setup', callSid: 'CA400', from: '+15558675370', to: '+15558675309' })
+check('setup records the call sid', session.state.callSid === 'CA400')
+session.handle({ type: 'prompt', voicePrompt: 'hello', last: true })
+check('the session counts turns', session.state.turns === 1)
+check('the agent is deterministic',
+  testReceptionist({ voicePrompt: 'x' }).text === testReceptionist({ voicePrompt: 'x' }).text)
+check('an empty prompt is not answered',
+  session.handle({ type: 'prompt', voicePrompt: '   ', last: true }) === null)
+check('an unknown message type is absorbed',
+  session.handle({ type: 'something_new_twilio_added' }) === null)
+check('textMessage defaults match the documented shape',
+  JSON.stringify(textMessage('hi')) ===
+    JSON.stringify({ type: 'text', token: 'hi', last: true, interruptible: true, preemptible: false }))
+
+// --- 18. relay leaks nothing -------------------------------------------------
+
+const relayLog = readFileSync(logFile, 'utf8')
+check('the relay log holds no auth token', !relayLog.includes(AUTH_TOKEN))
+check('the relay log holds no full caller number', !relayLog.includes('+15558675360'))
+check('the relay log masks the caller', relayLog.includes('+1***5360'))
+check('the relay log kept the transcript as a business record',
+  relayLog.includes('I am locked out of my flat'))
+
+const relayHealth = await fetch(`http://127.0.0.1:${relayPort}/health`).then((r) => r.json())
+check('health reports relay mode', relayHealth.relay.enabled === true)
+check('health names the relay websocket path', relayHealth.webhooks.relay_websocket === '/twilio/voice/relay')
+check('health says the agent is the deterministic one', /deterministic/.test(relayHealth.relay.agent))
+check('health still leaks no credential', !JSON.stringify(relayHealth).includes(AUTH_TOKEN))
+
+relayGateway.relay?.close()
+relayGateway.close()
+
+// Put the world back for anything after this point.
+process.env.TWILIO_VOICE_MODE = 'greeting'
+
 gateway.close()
 mockApi.close()
 
