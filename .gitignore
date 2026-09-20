@@ -30,3 +30,7 @@ public/mediapipe/
 # stray copy is ever made in the repo, it must not be committed.
 google-client.json
 google-tokens.json
+
+# Twilio gateway control token and call log live in ~/.jarvis, never here.
+twilio-gateway.token
+twilio-log.jsonl

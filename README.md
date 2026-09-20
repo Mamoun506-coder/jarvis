@@ -269,6 +269,100 @@ Four ways to see whether it is linked, which all read the same state:
 
 ---
 
+## Customer communications (Twilio)
+
+A **separate local service** on **port 8788**, so the bridge on 8787 is never
+the thing exposed. The gateway speaks only Twilio's two webhook shapes, refuses
+anything Twilio did not sign, and is the only process that holds the Twilio
+credentials.
+
+```
+  internet ──tunnel──▶ :8788 gateway ──loopback──▶ :8787 bridge (never exposed)
+                         │  signature-checked          │
+                         │  rate-limited               │  four named tools,
+                         └─ holds the secrets          └─ holds no secrets
+```
+
+### Setting it up
+
+Secrets come from the environment only — there is no file in this repo to put
+them in, and nothing is written back to disk:
+
+```bash
+export TWILIO_ACCOUNT_SID=AC...
+export TWILIO_AUTH_TOKEN=...
+export TWILIO_PHONE_NUMBER=+15551234567     # the business number
+export OWNER_PHONE_NUMBER=+15559876543      # where transfers go
+export TWILIO_PUBLIC_BASE_URL=https://your-tunnel.example.com
+```
+
+Start it, in its own terminal:
+
+```bash
+npm run twilio:start        # http://127.0.0.1:8788
+npm run twilio:selftest     # 63 checks, no credentials and no phone calls
+```
+
+`GET http://127.0.0.1:8788/health` reports what is configured — as booleans and
+masked numbers, never values.
+
+### Webhook paths
+
+Point a tunnel (`cloudflared`, `ngrok`) at **port 8788**, set
+`TWILIO_PUBLIC_BASE_URL` to that https address, and configure the number in the
+Twilio console:
+
+| Twilio setting | URL | Method |
+|---|---|---|
+| Voice — "A call comes in" | `{TWILIO_PUBLIC_BASE_URL}/twilio/voice/incoming` | POST |
+| Voice — "Call status changes" | `{TWILIO_PUBLIC_BASE_URL}/twilio/voice/status` | POST |
+| Messaging — "A message comes in" | `{TWILIO_PUBLIC_BASE_URL}/twilio/sms/incoming` | POST |
+
+`/twilio/voice/choice` is reached from the greeting itself and is not
+configured in the console. The base URL must match exactly: Twilio signs the
+URL it called, and the gateway verifies against the configured one rather than
+the inbound `Host` header, which an attacker controls.
+
+### Letting JARVIS use it
+
+Off by default. The four tools — `send_customer_sms`, `place_customer_call`,
+`transfer_call_to_owner`, `send_appointment_reminder` — are enabled by their
+**own** switch, which is not `JARVIS_ALLOW_WRITES`:
+
+```bash
+JARVIS_ALLOW_COMMS=1 npm start
+```
+
+That turns on those four tools and nothing else. Shell, file writes and device
+control stay exactly as they were.
+
+### What protects it
+
+- **Signatures.** Every webhook is HMAC-verified against the account auth
+  token. Unsigned, mis-signed, or signed for a different path or different
+  parameters: all 403.
+- **E.164 only.** `+447700900123` is a number; `07700900123` is refused rather
+  than guessed at.
+- **Rate limits.** Per-sender and global, inbound; per-number burst and daily
+  caps, outbound. Premium-rate ranges are refused outright.
+- **Transfers go one place.** `transfer_call_to_owner` takes no destination —
+  `OWNER_PHONE_NUMBER` is the only place a live call can be sent.
+- **The bridge holds no Twilio secret.** It calls the gateway on loopback with
+  a local token from `~/.jarvis/twilio-gateway.token` (0600).
+- **Logs record the traffic, never the credentials.** The business record is
+  `~/.jarvis/twilio-log.jsonl` (0600); the terminal gets masked numbers and no
+  message bodies.
+
+### Live AI voice, later
+
+Incoming calls currently get a greeting and a "press 1 for a person" transfer.
+`twilio/twiml.mjs` has a `relay` mode for Twilio ConversationRelay already
+shaped; switching to it means supplying a WebSocket URL and a conversation
+loop. It is deliberately not wired up — it would put a live microphone into an
+agent, and that needs its own gate.
+
+---
+
 ## Controls
 
 | Key / phrase | Does |

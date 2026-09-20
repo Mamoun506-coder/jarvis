@@ -22,6 +22,7 @@ import { uiServer } from './ui.mjs'
 import { chromeAvailable, chromeServer } from './chrome.mjs'
 import { visionServer } from './vision.mjs'
 import { googleServer, status as googleStatus } from './google.mjs'
+import { COMMS_TOOLS, commsEnabled, commsServer } from './comms.mjs'
 import { homedir, tmpdir } from 'node:os'
 import { readFileSync, realpathSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
@@ -283,6 +284,18 @@ function decideTool(name) {
     // and the real gate is the browser's own camera permission plus an
     // indicator the user can see for as long as it is live.
     if (server === 'jarvis_eyes') return true
+
+    // Customer communications. The only tools here that reach a stranger's
+    // phone, and the only ones gated on their own switch rather than the
+    // global one: JARVIS_ALLOW_COMMS turns on four named tools and nothing
+    // else, so answering customers never requires also enabling shell
+    // commands, file writes and device control. The name check is an
+    // allowlist rather than a verb rule — `send_customer_sms` would be read
+    // as a write by the regex below, which is correct but not specific
+    // enough to be the whole answer for a surface this consequential.
+    if (server === 'jarvis_comms') {
+      return COMMS_TOOLS.has(mcpToolOf(name)) && commsEnabled()
+    }
 
     const tool = mcpToolOf(name)
     if (EFFECTFUL_VERB.test(tool) && !VETO_EXEMPT.has(`${server}__${tool}`)) {
@@ -1037,6 +1050,11 @@ console.log(`[jarvis] model ${MODEL} · effort ${EFFORT}`)
   )
 }
 console.log(
+  commsEnabled()
+    ? '[jarvis] customer comms ENABLED — sms, calls and transfers can reach real phones'
+    : '[jarvis] customer comms off (set JARVIS_ALLOW_COMMS=1 to enable the four Twilio tools)',
+)
+console.log(
   `[jarvis] writes ${ALLOW_WRITES ? 'ENABLED' : 'disabled'}` +
     (ALLOW_WRITES ? '' : ' — set JARVIS_ALLOW_WRITES=1 to permit shell/file/device actions'),
 )
@@ -1268,6 +1286,10 @@ wss.on('connection', (socket) => {
         // precisely when it is not, and the read tools say what to run
         // rather than failing silently.
         google: googleServer(),
+        // Twilio, through the separate local gateway. Registered always, so
+        // the model can be told the feature is off rather than finding the
+        // tool missing and inventing a reason.
+        jarvis_comms: commsServer(),
       },
       // A plain system prompt, not the claude_code preset. The preset is
       // tuned for a coding agent — verbose, file-oriented, and a large chunk
