@@ -212,6 +212,63 @@ chose.
 
 ---
 
+## Gmail and Calendar
+
+JARVIS can read your mail and your schedule directly, over the Google APIs —
+no Chrome open, nothing on screen, no page being scraped.
+
+```
+"What emails did I get today?"
+"Anything important from Quick Assist customers?"
+"What's on my calendar tomorrow?"
+```
+
+**Read-only, and enforced at the token.** Two scopes are requested,
+`gmail.readonly` and `calendar.readonly`, plus your email address so the status
+can name the account. There is no code here that sends, deletes or changes
+anything, and if there were, Google would refuse it: the token has never been
+granted the right. Mail is fetched as metadata — sender, subject, date and
+Gmail's own one-line snippet. Message bodies are never requested.
+
+**Your password is never involved.** Sign-in happens on Google's own pages
+(OAuth 2.0, authorization code with PKCE, loopback redirect — what Google
+specifies for desktop apps). The bridge only ever holds the tokens that come
+back, in `~/.jarvis/google-tokens.json` at `0600`, outside this repository.
+Nothing logs a token: the bridge prints counts, never contents.
+
+### Connecting
+
+One-time Google setup, because the OAuth client has to be yours:
+
+1. <https://console.cloud.google.com/apis/credentials> — create a project.
+2. Enable the **Gmail API** and the **Google Calendar API**.
+3. Configure the OAuth consent screen and add yourself as a test user.
+4. **Create credentials → OAuth client ID → Desktop app.**
+5. Download the JSON and save it as `~/.jarvis/google-client.json`.
+
+Then:
+
+```bash
+npm run google:connect      # opens Google, stores the tokens
+npm run google:status       # connected, and as whom
+npm run google:disconnect   # forget the tokens on this machine
+```
+
+`google:disconnect` removes the tokens from this machine. To revoke access at
+Google as well, remove JARVIS at <https://myaccount.google.com/permissions>.
+
+### Status
+
+Four ways to see whether it is linked, which all read the same state:
+
+- **Ask him** — *"are you connected to my Gmail?"* He has a
+  `check_google_connection` tool and will say which account, or what to run.
+- `npm run google:status`
+- The bridge says so on startup: `[jarvis] google connected as you@example.com`
+- `GET /google/status` on the bridge, and a `google` flag on `/health`.
+
+---
+
 ## Controls
 
 | Key / phrase | Does |

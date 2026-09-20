@@ -21,6 +21,7 @@ import { displayServer } from './panels.mjs'
 import { uiServer } from './ui.mjs'
 import { chromeAvailable, chromeServer } from './chrome.mjs'
 import { visionServer } from './vision.mjs'
+import { googleServer, status as googleStatus } from './google.mjs'
 import { homedir, tmpdir } from 'node:os'
 import { readFileSync, realpathSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
@@ -217,6 +218,10 @@ const READ_ONLY_MCP = new Set([
   // make_outbound_call, delete_character, create_* and edit_image. Generation
   // runs; acting on the world does not.
   'higgsfield', 'heygen', 'elevenlabs',
+  // Gmail and Calendar, and it is read-only at the token: the OAuth grant
+  // carries only `.readonly` scopes, so Google itself refuses anything
+  // else no matter what this gate decides. The veto below still stands.
+  'google',
 ])
 
 /**
@@ -684,7 +689,23 @@ const handleRequest = async (req, res) => {
     // student with nothing configured still has a working assistant.
     const eleven = Boolean(elevenKey())
     res.writeHead(200, { ...cors, 'content-type': 'application/json' })
-    return res.end(JSON.stringify({ ok: true, tts: eleven, stt: eleven }))
+    // `google` is added alongside, never in place of, the existing keys — the
+    // browser's boot path reads tts and stt and must keep finding them.
+    return res.end(
+      JSON.stringify({
+        ok: true,
+        tts: eleven,
+        stt: eleven,
+        google: googleStatus().connected,
+      }),
+    )
+  }
+
+  // Whether Gmail and Calendar are linked, and to which account. Carries no
+  // token and no secret — only what a status line is allowed to say.
+  if (req.method === 'GET' && req.url === '/google/status') {
+    res.writeHead(200, { ...cors, 'content-type': 'application/json' })
+    return res.end(JSON.stringify(googleStatus()))
   }
 
   // Serve local image files to the page. Screenshots and generated art land on
@@ -1005,6 +1026,16 @@ console.log(
   `[jarvis] speech ${elevenKey() ? 'via ElevenLabs (key from MCP config)' : 'using browser fallback voice'}`,
 )
 console.log(`[jarvis] model ${MODEL} · effort ${EFFORT}`)
+{
+  // Said at startup for the same reason the model is: it is the answer to
+  // "why did it say it cannot see my mail", and nobody should have to ask.
+  const g = googleStatus()
+  console.log(
+    g.connected
+      ? `[jarvis] google connected${g.email ? ` as ${g.email}` : ''} · gmail + calendar, read-only`
+      : `[jarvis] google not connected — ${g.reason}`,
+  )
+}
 console.log(
   `[jarvis] writes ${ALLOW_WRITES ? 'ENABLED' : 'disabled'}` +
     (ALLOW_WRITES ? '' : ' — set JARVIS_ALLOW_WRITES=1 to permit shell/file/device actions'),
@@ -1232,6 +1263,11 @@ wss.on('connection', (socket) => {
         jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES }),
         // The camera, which unlike everything else here has to ask and wait.
         jarvis_eyes: visionServer(ask),
+        // Gmail and Calendar. Registered whether or not an account is
+        // connected: `check_google_connection` has to be answerable
+        // precisely when it is not, and the read tools say what to run
+        // rather than failing silently.
+        google: googleServer(),
       },
       // A plain system prompt, not the claude_code preset. The preset is
       // tuned for a coding agent — verbose, file-oriented, and a large chunk

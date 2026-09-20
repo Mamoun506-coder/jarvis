@@ -17,7 +17,11 @@
     "bridge": "node bridge/server.mjs",
     "bridge:writes": "JARVIS_ALLOW_WRITES=1 node bridge/server.mjs",
     "setup": "node scripts/setup.mjs",
-    "setup:mac": "bash scripts/mac-setup.sh"
+    "setup:mac": "bash scripts/mac-setup.sh",
+    "google:connect": "node scripts/google-connect.mjs connect",
+    "google:status": "node scripts/google-connect.mjs status",
+    "google:disconnect": "node scripts/google-connect.mjs disconnect",
+    "google:selftest": "node scripts/google-selftest.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.220",
