@@ -20,6 +20,13 @@
 import { WebSocketServer } from 'ws'
 import { config, maskNumber, redact } from './config.mjs'
 import { RateLimit, logEvent, validSignature } from './guard.mjs'
+import {
+  FALLBACK_LINE,
+  GREETING,
+  createReceptionist,
+  emptyIntake,
+  receptionistMode,
+} from './receptionist.mjs'
 
 /** A transcript line is short. Anything this size is not ConversationRelay. */
 const MAX_MESSAGE_BYTES = 64 * 1024
@@ -46,9 +53,7 @@ export const relayEnabled = () => (process.env.TWILIO_VOICE_MODE ?? 'greeting') 
 
 export const relayUrl = () => process.env.TWILIO_RELAY_WEBSOCKET_URL?.trim() || null
 
-export const relayGreeting = () =>
-  process.env.TWILIO_RELAY_GREETING?.trim() ||
-  'Thank you for calling Quick Assist Locksmith. How can I help you today?'
+export const relayGreeting = () => process.env.TWILIO_RELAY_GREETING?.trim() || GREETING
 
 // --------------------------------------------------------------------------
 // The agent
@@ -104,14 +109,28 @@ export const textMessage = (token, { last = true, interruptible = true, preempti
  * conversation through it without a socket, and so the message handling is
  * testable separately from the transport that carries it.
  */
-export function createSession(send) {
-  const state = { callSid: null, from: null, to: null, sessionId: null, turns: 0 }
+export function createSession(send, { receptionist, onHandoff } = {}) {
+  const state = {
+    callSid: null,
+    from: null,
+    to: null,
+    sessionId: null,
+    turns: 0,
+    // Per-call, in memory, and gone when the call is. The receptionist reads
+    // and writes these; nothing else does.
+    intake: emptyIntake(),
+    history: [],
+  }
+
+  // One receptionist per call, so a session can never see another's history.
+  const agent = receptionist ?? createReceptionist()
 
   return {
     state,
+    agent,
 
     /** @param {object} message one decoded ConversationRelay message */
-    handle(message) {
+    async handle(message) {
       const type = message?.type
 
       switch (type) {
@@ -147,20 +166,45 @@ export function createSession(send) {
           if (!heard) return null
 
           state.turns++
-          const reply = testReceptionist({ voicePrompt: heard, lang: message.lang }, state)
+
+          // The receptionist is the only thing that decides what is said.
+          // Its guards live inside it, so this transport cannot accidentally
+          // route around them.
+          let reply
+          try {
+            reply = await agent.respond(heard, state)
+          } catch (err) {
+            // Belt and braces: the receptionist already catches its own
+            // failures, so reaching here means something unexpected. A caller
+            // waiting in silence is the one outcome not allowed.
+            logEvent('relay.receptionist_failed', {
+              sid: state.callSid,
+              reason: redact(err?.message ?? String(err)),
+            })
+            reply = { say: FALLBACK_LINE, handoff: true, source: 'transport-error' }
+          }
 
           logEvent('relay.prompt', {
             sid: state.callSid,
             chars: heard.length,
             lang: message.lang ?? null,
+            status: reply.source ?? 'unknown',
             // The business record keeps what was said; the console line above
             // gets only the length. Same split as an SMS body.
             body: heard,
-            reply: reply.text,
+            reply: reply.say,
           })
 
-          const out = textMessage(reply.text)
+          const out = textMessage(reply.say)
           send?.(out)
+
+          // A handoff is a request to get a person, not a permission grant:
+          // it is recorded and surfaced, and the existing transfer path is
+          // what actually moves the call.
+          if (reply.handoff) {
+            logEvent('relay.handoff_requested', { sid: state.callSid, status: reply.source ?? '' })
+            onHandoff?.(state)
+          }
           return out
         }
 
@@ -294,7 +338,7 @@ export function attachRelay(server, { onSession } = {}) {
         idle = setTimeout(() => ws.close(1000, 'idle'), IDLE_MS)
       }
 
-      ws.on('message', (raw) => {
+      ws.on('message', async (raw) => {
         touch()
         let message
         try {
@@ -304,7 +348,7 @@ export function attachRelay(server, { onSession } = {}) {
           return
         }
         try {
-          session.handle(message)
+          await session.handle(message)
         } catch (err) {
           // One malformed turn must not drop a live call.
           logEvent('relay.handler_failed', {
@@ -317,9 +361,14 @@ export function attachRelay(server, { onSession } = {}) {
       ws.on('close', () => {
         clearTimeout(idle)
         sessions.delete(ws)
+        // The point of the call: what was taken down about the job. Numbers
+        // inside it are the caller's own callback, which is the record's
+        // reason for existing, so it is kept as given — this file is 0600 and
+        // outside the repository.
         logEvent('relay.closed', {
           sid: session.state.callSid,
           status: `${session.state.turns} turn(s)`,
+          intake: session.state.intake,
         })
       })
 
@@ -346,7 +395,11 @@ export const relayStatus = () => ({
   // The URL is public by nature — Twilio is told it, and it is in the TwiML —
   // so it is safe to report. The masked numbers rule is about callers.
   websocket_url: relayUrl(),
-  agent: 'test-receptionist (deterministic, no model)',
+  agent:
+    receptionistMode() === 'ai'
+      ? `restricted AI receptionist (${process.env.TWILIO_RECEPTIONIST_MODEL?.trim() || 'claude-opus-5'}, no tools)`
+      : 'test-receptionist (deterministic, no model)',
+  receptionist_mode: receptionistMode(),
 })
 
 export { maskNumber }

@@ -370,13 +370,64 @@ The URL is the **wss://** form of the same tunnel, path `/twilio/voice/relay`.
 It must match exactly: Twilio signs the handshake over that URL, and the
 gateway verifies against the configured value, never the inbound `Host`.
 
-**The agent does not think yet.** Version one is a deterministic test
-receptionist — it repeats what it heard and names itself. Replacing it is one
-function, `testReceptionist()` in `twilio/relay.mjs`; everything around it
-(handshake signature, rate limits, logging, message handling) is already tested
-and stays as it is. It is deliberately separate because wiring a stranger's
-voice into the JARVIS reasoning loop — which holds mail, calendar and a phone
-line — deserves its own change and its own gate.
+### The receptionist
+
+Two receptionists sit behind one adapter. The **deterministic** one is the
+default and is unchanged. The **restricted AI** one answers as Quick Assist
+Locksmith and is off unless you switch it on:
+
+```bash
+export TWILIO_RECEPTIONIST_MODE=ai
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Back to safe mode — unset it, or set anything else:
+
+```bash
+unset TWILIO_RECEPTIONIST_MODE     # or: export TWILIO_RECEPTIONIST_MODE=deterministic
+```
+
+It takes automotive, residential and roadside intake into a structured record,
+declines German vehicles, refuses to quote prices or promise arrival times, and
+sends life-threatening emergencies to 911.
+
+#### The security boundary
+
+**The caller does not talk to JARVIS.** The receptionist is a bare Messages API
+call with **no tools of any kind** — no Agent SDK, no MCP servers, no
+filesystem, no shell, no Gmail, no calendar, no browser. There is no mechanism
+for a caller to reach any of those. That is architecture, not prompt wording: a
+prompt can be argued with, a missing tool cannot.
+
+Three layers sit on top:
+
+1. **Deterministic refusals run before the model.** Emergencies, credential
+   requests, shell commands, Gmail/calendar requests and prompt-extraction
+   attempts are answered by code, and never reach the model at all.
+2. **Caller speech is delimited and labelled untrusted**, so an instruction
+   inside it reads as reported speech rather than an order.
+3. **The reply is scanned on the way out.** Anything resembling a credential,
+   an environment variable, a file path or a system-prompt leak is discarded
+   whole and replaced with the safe line.
+
+German makes are refused in code as well as in the prompt — both when the
+caller says one and when one appears only in the captured intake.
+
+#### Fail-safe
+
+Model timeout, error, or unparseable output all produce the same thing:
+
+> "I'm sorry, I'm having trouble with the system right now. Let me get someone
+> to help you."
+
+and a handoff request. Nothing is granted extra permission to recover.
+
+#### Tuning
+
+`TWILIO_RECEPTIONIST_MODEL` (default `claude-opus-5`) and
+`TWILIO_RECEPTIONIST_TIMEOUT_MS` (default 8000). A caller waits in silence
+while the model thinks, so if turns feel slow, the model is the lever — that
+choice is yours, not the code's.
 
 Messages handled: `setup`, `prompt`, `dtmf`, `interrupt`, `error`. Partial
 prompts (`last: false`) are ignored so JARVIS does not talk over the caller.
